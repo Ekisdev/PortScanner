@@ -5,9 +5,14 @@ Only 127.0.0.1 (and its alias "localhost") is ever scanned. A separate
 process opens a fixed set of listening sockets; both implementations scan the
 same ports and must return the same results before their times are compared.
 
-    python benchmark.py                   # all scenarios (about 10 minutes)
+    python benchmark.py                   # all scenarios (about 8 minutes)
     python benchmark.py --runs 1          # quick pass
     python benchmark.py --scenario sweep  # only scenarios whose key contains "sweep"
+
+Implementations: "old" is the plain baseline below; "new" is portscanner with
+the threads engine; "new-select" is the select engine; "new-no-fix" is the
+threads engine with the Windows loopback option switched off, which is how a
+non-loopback Windows target behaves.
 
 The plain baseline is a reconstruction from the project description, not the
 lost original: a Queue of ports, N daemon threads, one fresh socket per port,
@@ -160,16 +165,32 @@ def old_design_scan(target, ports, threads, timeout, grab_banners):
     return sorted(results)
 
 
-def new_design_scan(target, ports, threads, timeout, grab_banners):
-    """The current portscanner.scan, including the one-off name resolution."""
-    ip = socket.gethostbyname(target)
-    result = portscanner.scan(
-        ip, ports, threads=threads, timeout=timeout, grab_banners=grab_banners, host=target
-    )
-    return [(r.port, r.banner) for r in result.open_ports]
+def _new_scan(engine, loopback_fix=True):
+    """Build a runner for portscanner.scan with the given engine.
+
+    With ``loopback_fix=False`` the Windows SYN-retransmit option is switched
+    off, which is how a non-loopback target behaves.
+    """
+    def run(target, ports, threads, timeout, grab_banners):
+        resolved = portscanner.resolve_target(target)  # resolution is part of the timing
+        saved = portscanner._disable_syn_retransmit
+        if not loopback_fix:
+            portscanner._disable_syn_retransmit = lambda sock: None
+        try:
+            result = portscanner.scan(resolved, ports, threads=threads, timeout=timeout,
+                                      grab_banners=grab_banners, engine=engine)
+        finally:
+            portscanner._disable_syn_retransmit = saved
+        return [(r.port, r.banner) for r in result.open_ports]
+    return run
 
 
-IMPLEMENTATIONS = {"old": old_design_scan, "new": new_design_scan}
+IMPLEMENTATIONS = {
+    "old": old_design_scan,
+    "new": _new_scan("threads"),
+    "new-select": _new_scan("select"),
+    "new-no-fix": _new_scan("threads", loopback_fix=False),
+}
 
 
 # --------------------------------------------------------------------------
@@ -178,49 +199,67 @@ IMPLEMENTATIONS = {"old": old_design_scan, "new": new_design_scan}
 
 class Scenario:
     def __init__(self, key, title, spec, threads, timeout, banners, runs, impls=("old", "new"),
-                 target="127.0.0.1"):
+                 target="127.0.0.1", check="expected"):
         self.key, self.title, self.spec = key, title, spec
         self.threads, self.timeout, self.banners = threads, timeout, banners
         self.runs, self.impls, self.target = runs, impls, target
+        self.check = check  # "expected": compare with the test server layout; "agree": with each other
 
 
 def build_scenarios():
+    both = ("old", "new-no-fix", "new", "new-select")
     scenarios = [
-        Scenario("main", "1024 ports, 19 open, banners on", MAIN_SPEC, 100, 1.0, True, 5),
-        Scenario("main-nobanner", "1024 ports, 19 open, --no-banner", MAIN_SPEC, 100, 1.0, False, 5),
-        Scenario("hostname", "as main, target 'localhost' instead of 127.0.0.1", MAIN_SPEC, 100, 1.0,
-                 True, 3, target="localhost"),
-        Scenario("heavy", "200 ports, all open and silent, banners on", HEAVY_SPEC, 100, 1.0, True, 5),
-        Scenario("heavy-nobanner", "200 ports, all open, --no-banner", HEAVY_SPEC, 100, 1.0, False, 5),
+        Scenario("main", "1024 ports, 19 open, banners on, 100 threads", MAIN_SPEC, 100, 1.0, True, 5,
+                 impls=both),
+        Scenario("main-500", "same, 500 threads (select: 500 in flight)", MAIN_SPEC, 500, 1.0, True, 5,
+                 impls=("new-no-fix", "new", "new-select")),
+        Scenario("heavy", "200 ports, all open and silent, banners on", HEAVY_SPEC, 100, 1.0, True, 5,
+                 impls=("old", "new", "new-select")),
+        Scenario("heavy-nobanner", "200 ports, all open, --no-banner", HEAVY_SPEC, 100, 1.0, False, 5,
+                 impls=("old", "new", "new-select")),
+        Scenario("full-range", "all 65535 ports, 500 threads, banners on", "1-65535", 500, 1.0, True, 3,
+                 impls=("new", "new-select"), check="agree"),
     ]
     for threads in (50, 200, 500, 1000):
         scenarios.append(Scenario(f"sweep-threads-{threads}",
-                                  f"thread sweep: 1024 ports, {threads} threads", MAIN_SPEC,
-                                  threads, 1.0, True, 3))
+                                  f"1024 ports, {threads} threads, no loopback fix", MAIN_SPEC,
+                                  threads, 1.0, True, 3, impls=("old", "new-no-fix")))
     for timeout in (0.25, 0.5, 2.5):
         scenarios.append(Scenario(f"sweep-timeout-{timeout}",
-                                  f"timeout sweep: 1024 ports, timeout {timeout:g}s", MAIN_SPEC,
-                                  100, timeout, True, 2, impls=("new",)))
+                                  f"1024 ports, 100 threads, timeout {timeout:g}s, no loopback fix",
+                                  MAIN_SPEC, 100, timeout, True, 2, impls=("new-no-fix",)))
     return scenarios
 
 
 def run_scenario(scenario, expected_open, runs_override):
     ports = portscanner.parse_ports(scenario.spec)
-    wanted = {p: (b if scenario.banners else "") for p, b in expected_open.items() if p in set(ports)}
+    port_set = set(ports)
+    wanted = {p: (b if scenario.banners else "") for p, b in expected_open.items() if p in port_set}
     runs = runs_override or scenario.runs
     times = {name: [] for name in scenario.impls}
+    reference = None
     for _ in range(runs):
         for name in scenario.impls:  # alternate implementations to spread drift evenly
             start = time.perf_counter()
             found = IMPLEMENTATIONS[name](scenario.target, ports, scenario.threads, scenario.timeout,
                                           scenario.banners)
             times[name].append(time.perf_counter() - start)
-            if dict(found) != wanted:
-                missing = sorted(set(wanted) - {p for p, _ in found})
-                extra = sorted({p for p, _ in found} - set(wanted))
-                print(f"  WARNING {name}: result differs from expected "
-                      f"(missing {missing}, unexpected {extra})", flush=True)
-    return times, len(wanted)
+            if scenario.check == "expected":
+                if dict(found) != wanted:
+                    missing = sorted(set(wanted) - {p for p, _ in found})
+                    extra = sorted({p for p, _ in found} - set(wanted))
+                    print(f"  WARNING {name}: result differs from expected "
+                          f"(missing {missing}, unexpected {extra})", flush=True)
+            else:  # "agree": other listeners exist on this machine, so compare implementations
+                ports_found = [p for p, _ in found]
+                if reference is None:
+                    reference = ports_found
+                elif ports_found != reference:
+                    print(f"  WARNING {name}: open ports differ from the first run "
+                          f"(+{sorted(set(ports_found) - set(reference))} "
+                          f"-{sorted(set(reference) - set(ports_found))})", flush=True)
+    open_count = len(wanted) if scenario.check == "expected" else len(reference or [])
+    return times, open_count
 
 
 def print_environment():
